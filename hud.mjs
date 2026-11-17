@@ -32,18 +32,19 @@
  *  - Cache (session cache-hit rate) and tok/s are aggregated from the session
  *    transcript JSONL, scanned incrementally: each render reads only the bytes
  *    appended since the last one and folds them into a cached running total.
- *  - cpu/mem read /proc (Linux only); disk uses statfs everywhere.
+ *  - cpu/mem read /proc on Linux; on macOS cpu comes from node:os per-core
+ *    counters and mem from vm_stat. disk uses statfs everywhere.
  *
  * Optional config: ~/.claude/hud/config.json
  *   { "diskPath": "/data", "cols": [9, 9, 10], "sep": "⋮" }
  */
 
 import { readFileSync, writeFileSync, statfsSync } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { homedir } from 'node:os';
+import { execSync, execFileSync } from 'node:child_process';
+import { homedir, cpus, totalmem } from 'node:os';
 import { join } from 'node:path';
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 
 const HOME = homedir();
 const HUD_DIR = join(HOME, '.claude', 'hud');
@@ -236,7 +237,15 @@ function readProcStat() {
     const parts = line.trim().split(/\s+/).slice(1).map(Number);
     const [user = 0, nice = 0, system = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0] = parts;
     return { total: user + nice + system + idle + iowait + irq + softirq + steal, idle: idle + iowait, ts: Date.now() };
-  } catch { return null; }
+  } catch { return cpuSampleFromCpus(cpus()); }
+}
+
+// No /proc (macOS): sum the per-core counters node:os exposes; same delta math applies.
+function cpuSampleFromCpus(list) {
+  if (!Array.isArray(list) || !list.length) return null;
+  let total = 0, idle = 0;
+  for (const c of list) { for (const v of Object.values(c.times)) total += v; idle += c.times.idle; }
+  return { total, idle, ts: Date.now() };
 }
 
 function getCpuPct() {
@@ -264,7 +273,19 @@ function getMemPct() {
     const total = pick('MemTotal'), available = pick('MemAvailable');
     if (!total || available == null) return null;
     return Math.round(((total - available) / total) * 100);
-  } catch { return null; }
+  } catch {
+    if (process.platform !== 'darwin') return null;
+    try { return memPctFromVmStat(execFileSync('vm_stat', { encoding: 'utf8', timeout: 1000 }), totalmem()); } catch { return null; }
+  }
+}
+
+// macOS vm_stat: "used" the way Activity Monitor counts it = active + wired + compressed pages.
+function memPctFromVmStat(text, totalBytes) {
+  const page = Number((text.match(/page size of (\d+) bytes/) || [])[1]);
+  const pages = (key) => Number((text.match(new RegExp(`^${key}:\\s+(\\d+)\\.`, 'm')) || [])[1]);
+  const used = pages('Pages active') + pages('Pages wired down') + pages('Pages occupied by compressor');
+  if (!page || !totalBytes || Number.isNaN(used)) return null;
+  return Math.max(0, Math.min(100, Math.round((used * page / totalBytes) * 100)));
 }
 
 function getDiskPct(path) {

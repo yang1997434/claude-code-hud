@@ -3,7 +3,7 @@
 // directory so the real caches, Keychain and network are never touched.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -15,7 +15,7 @@ const base = { model: { id: 'claude-opus-5-5', display_name: 'Opus 5.5' }, effor
   cwd: '/srv/projects/myapp' };
 const week = { used_percentage: 17 };
 
-function render(payload, sys) {
+function render(payload, sys, setup = () => ({})) {
   const home = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'hud-test-'));
   try {
     const dir = join(home, '.claude', 'hud');
@@ -25,7 +25,7 @@ function render(payload, sys) {
       data: { name: 'Fable', pct: 16, resets_at: null, active: false } }));
     if (sys) writeFileSync(join(dir, '.sys-cache.json'), JSON.stringify(sys));
     const r = spawnSync(process.execPath, [HUD], { input: JSON.stringify(payload), encoding: 'utf8',
-      env: { ...process.env, HOME: home } });
+      env: { ...process.env, HOME: home, ...setup(home) } });
     assert.equal(r.status, 0, r.stderr);
     return r.stdout.replace(/\x1b\[[0-9;]*m/g, '').replace(/\u00a0/g, ' ').trimEnd().split('\n');
   } finally { rmSync(home, { recursive: true, force: true }); }
@@ -66,4 +66,26 @@ test('effort cell is the level alone: no thinking tag, on or off', () => {
     assert.match(rows[1], /^xhigh\s+⋮/);
     assert.ok(!/💭|\bOn\b|\bOff\b/.test(rows.join('\n')));
   }
+});
+
+// An old sample in the cache gives the delta something to subtract from, so
+// the first render already has a CPU number.
+const oldCpu = () => ({ cpu: { total: 0, idle: 0, ts: Date.now() - 1000 } });
+
+test('cpu and mem show numbers on Linux and macOS', { skip: !['linux', 'darwin'].includes(process.platform) }, () => {
+  const rows = render({ ...base, rate_limits: { seven_day: week } }, oldCpu());
+  assert.match(rows[0], /⋮ cpu\s+\d+% ⋮/);
+  assert.match(rows[1], /⋮ mem\s+\d+% ⋮/);
+});
+
+test('macOS: unreadable vm_stat output leaves mem as a dash, the rest still renders', { skip: process.platform !== 'darwin' }, () => {
+  const rows = render({ ...base, rate_limits: { seven_day: week } }, oldCpu(), (home) => {
+    const bin = join(home, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'vm_stat'), '#!/bin/sh\necho nonsense\n');
+    chmodSync(join(bin, 'vm_stat'), 0o755);
+    return { PATH: bin + ':' + process.env.PATH };
+  });
+  assert.match(rows[1], /⋮ mem\s+— ⋮/);
+  assert.match(rows[0], /⋮ cpu\s+\d+% ⋮/);
 });

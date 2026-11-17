@@ -77,7 +77,7 @@ Either way, the installer copies `hud.mjs` to `~/.claude/hud/`, backs up your `s
 - A **subscription login** (Pro / Max / Ultra) for the quota column. On API-key setups those cells don't render; everything else still works.
 - The per-model weekly row needs the OAuth token Claude Code already stores locally (macOS Keychain, `~/.claude/.credentials.json`, or `CLAUDE_CODE_OAUTH_TOKEN`). Without it that one row is simply absent.
 - Linux or macOS (the installer and the plugin hook are bash); Windows is untested.
-- CPU and memory read `/proc`, so they are Linux-only. Anything unavailable is silently skipped, never an error.
+- CPU and memory work on both: Linux reads `/proc`, macOS uses Node's per-core counters and `vm_stat`. Anything unavailable shows a dash, never an error.
 
 ## Configuration
 
@@ -104,7 +104,7 @@ Optional. Create `~/.claude/hud/config.json`:
 - The **per-model weekly cap** is the one number Claude Code does not hand to the statusline. It is read from the same OAuth usage endpoint the CLI uses, with the token Claude Code already stores (if that access token has expired, it is refreshed with the stored refresh token for this call only — nothing is written back), and cached in `~/.claude/hud/.usage-cache.json` for 60s (30s after an error) so the 2s refresh never hits the API at that rate. The last good reading is kept across transient failures. Set `HUD_DEBUG=1` to log why a fetch failed.
 - **Cache** and **tok/s** are session-wide facts that stdin cannot supply — its `current_usage` describes only the latest request — so they are aggregated from the session transcript JSONL. The scan is incremental: a cache in `~/.claude/hud/.session-cache.json` holds a byte offset plus running totals, and each render parses only the bytes appended since the last one. Requests are de-duplicated by `requestId`, since one response can span several transcript records that repeat the same cumulative usage.
 - Column alignment is measured, not guessed: ANSI codes are stripped and the remainder is walked as grapheme clusters, counting emoji, flags and CJK as two cells.
-- CPU% is a delta between `/proc/stat` samples cached in `~/.claude/hud/.sys-cache.json`, so the first render shows `cpu —` and it settles from the second refresh on.
+- CPU% is a delta between two samples (`/proc/stat` on Linux, Node's per-core counters on macOS) cached in `~/.claude/hud/.sys-cache.json`, so the first render shows `cpu —` and it settles from the second refresh on. Memory on macOS is counted the way Activity Monitor does: active + wired + compressed pages.
 - **Privacy:** the only outbound requests go to Anthropic — the usage call and, when the stored token has expired, a token refresh — both with the credentials Claude Code already holds. Nothing else leaves your machine; the HUD reads local files and its own stdin.
 
 ## Uninstall
