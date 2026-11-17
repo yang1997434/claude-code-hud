@@ -2,9 +2,16 @@
 /**
  * Claude Code HUD — a 3-line, column-aligned statusline for Claude Code.
  *
- *   Opus 5          ⋮ ctx   52%     ⋮ cpu  32%  ⋮ 5h ●●●○○ 58% ↻3h10m
- *   xhigh 💭On      ⋮ tok/s  164    ⋮ mem  37%  ⋮ 7d ●○○○○ 17% ↻5d3h
- *   📁 ~/data/claude ⋮ Cache  99.2%  ⋮ disk  11% ⋮ Opus ●●●○○ 69% ↻1d6h
+ *   Opus 5          ⋮ ctx      52% ⋮ cpu   32% ⋮ 5h    ●●●○○  58% ↻3h10m
+ *   xhigh           ⋮ tok/s    164 ⋮ mem   37% ⋮ 7d    ●○○○○  17% ↻5d3h
+ *   📁 ~/data/claude ⋮ Cache  99.2% ⋮ disk  11% ⋮ Fable ●●●○○  69% ↻1d6h
+ *
+ * Accounts without a 5-hour window (verified Ultra) get the folder in the free
+ * column instead, where it has room for the whole path:
+ *
+ *   Opus 5     ⋮ ctx      52% ⋮ cpu   32% ⋮ 7d    ●○○○○  17% ↻5d3h
+ *   xhigh      ⋮ tok/s    164 ⋮ mem   37% ⋮ Fable ●●●○○  69% ↻1d6h
+ *              ⋮ Cache  99.2% ⋮ disk  11% ⋮ 📁 ~/data/claude/myapp
  *
  * Layout: a fixed 4-column grid. Columns 1–3 have FIXED widths (never derived
  * from content) and are separated by a dashed rule, so a value changing from 9% to 100%
@@ -17,7 +24,7 @@
  *
  * Data sources:
  *  - Everything on rows 1 and the quota column comes from the statusline stdin
- *    payload (model, effort, thinking, cwd, context_window, rate_limits).
+ *    payload (model, effort, cwd, context_window, rate_limits).
  *    Claude Code hands us rate_limits directly, so the 5h/7d cells cost nothing.
  *  - The per-model weekly cap ("Fable 69%") is the one number Claude Code does
  *    not hand to the statusline, so it is fetched from the OAuth usage endpoint
@@ -36,7 +43,7 @@ import { execSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 
 const HOME = homedir();
 const HUD_DIR = join(HOME, '.claude', 'hud');
@@ -57,13 +64,16 @@ function loadConfig() {
 const CFG = loadConfig();
 const DISK_PATH = typeof CFG.diskPath === 'string' ? CFG.diskPath : '/';
 // Fixed widths for columns 1–3. Column 4 is free.
-// Sized to the longest real content in each column and no wider: "Haiku 4.5",
+// Sized to the longest real content in each column and no wider: "Sonnet 5.5",
 // "ultracode", "tok/s 1234". Cell content is left-aligned against the divider;
 // only the number inside a metric is right-padded, so digits still stack.
-const COLS = Array.isArray(CFG.cols) && CFG.cols.length === 3
-  ? CFG.cols.map(Number) : [15, 12, 9];
+// Column 1 has two defaults: 15 while it also holds the folder (accounts with
+// a 5-hour window), 10 once the folder has moved to the free column.
+const USER_COLS = Array.isArray(CFG.cols) && CFG.cols.length === 3 ? CFG.cols.map(Number) : null;
+const COLS = USER_COLS ?? [15, 12, 9];
+const COL1_NO_FOLDER = USER_COLS ? USER_COLS[0] : 10;
 
-const EMO = { think: '💭', cwd: '📁' };
+const EMO = { cwd: '📁' };
 
 // ── Theme-aware palette ─────────────────────────────
 const rgb = (r, g, b) => `\x1b[38;2;${r};${g};${b}m`;
@@ -188,7 +198,7 @@ function quotaCircles(pct) {
   return `${clr}${'●'.repeat(full)}${C.dimGray}${'○'.repeat(5 - full)}${C.reset}`;
 }
 
-// The three quota rows stack in the free column, so they align among themselves:
+// The quota rows stack in the free column, so they align among themselves:
 // every label is padded to the widest one ("Fable" is longer than "5h"), which
 // puts the ring blocks, the percentages and the countdowns each in their own
 // sub-column. `labelW` is that shared width.
@@ -456,12 +466,36 @@ async function fetchScopedLimit() {
   } catch (e) { if (process.env.HUD_DEBUG) console.error("scoped fetch failed:", e?.name, e?.message); write(null, true); return cached; }
 }
 
-// ── cwd ─────────────────────────────────────────────
-// The folder cell is a fixed-width column now, so long paths elide instead of
-// stretching the grid. 3 cells go to the "📁 " prefix.
-const CWD_MAX = Math.max(8, COLS[0] - 3);
+// ── 5-hour window ───────────────────────────────────
+// Verified Ultra accounts have no 5-hour window, and their payload simply has
+// no five_hour bucket. But the bucket is also missing before a session's first
+// response and after a window has rolled over, so one missing bucket proves
+// nothing: remember when one was last seen (any session) and keep the 5-hour
+// layout for a day after that. An account that loses its window switches
+// layout a day later; one that still has it never flickers.
+const FIVE_HOUR_MEMORY_MS = 86_400_000;
+const FIVE_HOUR_STAMP_MS = 600_000;   // rewrite the timestamp at most every 10 min
 
-function fmtCwd(cwd) {
+function hasFiveHour(bucket, nowMs = Date.now()) {
+  let cache = {};
+  try { cache = JSON.parse(readFileSync(SYS_CACHE_PATH, 'utf8')) || {}; } catch { /* first run */ }
+  const seen = Number(cache.fiveHourSeen) || 0;
+  if (bucket && typeof bucket.used_percentage === 'number') {
+    if (nowMs - seen > FIVE_HOUR_STAMP_MS) {
+      try { cache.fiveHourSeen = nowMs; writeFileSync(SYS_CACHE_PATH, JSON.stringify(cache)); } catch { /* ignore */ }
+    }
+    return true;
+  }
+  return nowMs - seen < FIVE_HOUR_MEMORY_MS;
+}
+
+// ── cwd ─────────────────────────────────────────────
+// In column 1 the folder is a fixed-width cell, so long paths elide instead of
+// stretching the grid (3 cells go to the "📁 " prefix). In the free column it
+// has room for a full path or worktree name; only a very long one elides.
+const CWD_MAX_FREE = 48;
+
+function fmtCwd(cwd, CWD_MAX) {
   if (!cwd) return '';
   let p = cwd.startsWith(HOME) ? '~' + cwd.slice(HOME.length) : cwd;
   const wt = p.match(/^(.*?)\/\.claude\/worktrees\/([^/]+)$/);
@@ -510,16 +544,16 @@ function buildGrid(stdin, scoped) {
   const effLvl = String(stdin?.effort?.level ?? '').toLowerCase();
   const effColor = { low: C.green, medium: C.cyan, high: C.blue, xhigh: C.magenta,
                      ultracode: C.red, max: C.red }[effLvl] || C.white;
-  const thinkOn = stdin.thinking?.enabled !== false;
-  const thinkTag = `${EMO.think}${thinkOn ? C.green + 'On' : C.gray + 'Off'}${C.reset}`;
-  // Effort and thinking are one thought — "how hard is it working" — so they
-  // share a cell instead of each burning a column.
-  const effCell = effLvl
-    ? `${effColor}${effLvl}${C.reset} ${thinkTag}`
-    : thinkTag;
+  // Thinking is on by default, so it is not shown; the cell is the effort alone.
+  const effCell = effLvl ? `${effColor}${effLvl}${C.reset}` : '';
+
+  const rl = stdin.rate_limits || {};
+  const fiveHour = hasFiveHour(rl.five_hour);
+  const col1 = fiveHour ? COLS[0] : COL1_NO_FOLDER;
 
   const cwd = stdin.workspace?.current_dir ?? stdin.cwd ?? '';
-  const cwdCell = cwd ? `${EMO.cwd} ${C.white}${fmtCwd(cwd)}${C.reset}` : '';
+  const cwdMax = fiveHour ? Math.max(8, col1 - 3) : CWD_MAX_FREE;
+  const cwdCell = cwd ? `${EMO.cwd} ${C.white}${fmtCwd(cwd, cwdMax)}${C.reset}` : '';
 
   const cw = stdin.context_window;
   const ctxPct = cw
@@ -540,18 +574,26 @@ function buildGrid(stdin, scoped) {
     ? metric('tok/s', `${C.dim}   —${C.reset}`, COLS[1])
     : metric('tok/s', `${C.cyan}${String(Math.round(sess.tps)).padStart(4)}${C.reset}`, COLS[1]);
 
-  const rl = stdin.rate_limits || {};
   // Widest quota label wins; "5h" and "7d" pad up to it.
   const qw = Math.max(2, scoped?.name ? dispWidth(scoped.name) : 0);
+  const sevenDay = quotaCell('7d', rl.seven_day, qw);
+  const scopedRow = scopedCell(scoped, qw);
+
+  // Column 1 and the free column, top to bottom. With a 5-hour window the three
+  // quotas fill the free column and the folder sits under the effort; without
+  // one the quotas move up and the folder takes the freed slot.
+  const [left, free] = fiveHour
+    ? [[modelCell, effCell, cwdCell], [quotaCell('5h', rl.five_hour, qw), sevenDay, scopedRow]]
+    : [[modelCell, effCell, ''], [sevenDay, scopedRow, cwdCell]];
 
   const joiner = BAR ? ` ${BAR} ` : '   ';
   const rows = [
-    [fit(modelCell, COLS[0]), metric('ctx', pctVal(ctxPct), COLS[1]),
-     metric('cpu', pctVal(getCpuPct()), COLS[2]), quotaCell('5h', rl.five_hour, qw)],
-    [fit(effCell, COLS[0]), tpsCell,
-     metric('mem', pctVal(getMemPct()), COLS[2]), quotaCell('7d', rl.seven_day, qw)],
-    [fit(cwdCell, COLS[0]), chCell,
-     metric('disk', pctVal(getDiskPct(DISK_PATH)), COLS[2]), scopedCell(scoped, qw)],
+    [fit(left[0], col1), metric('ctx', pctVal(ctxPct), COLS[1]),
+     metric('cpu', pctVal(getCpuPct()), COLS[2]), free[0]],
+    [fit(left[1], col1), tpsCell,
+     metric('mem', pctVal(getMemPct()), COLS[2]), free[1]],
+    [fit(left[2], col1), chCell,
+     metric('disk', pctVal(getDiskPct(DISK_PATH)), COLS[2]), free[2]],
   ];
 
   return rows.map(cells => cells.filter(c => c !== '').join(joiner));

@@ -1,6 +1,6 @@
 {
   "name": "claude-code-hud",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "3-line, column-aligned statusline: model, context, session cache-hit rate, tok/s, cpu/mem/disk, and 5h / 7d / per-model weekly quota.",
   "author": {
     "name": "yang1997434",
